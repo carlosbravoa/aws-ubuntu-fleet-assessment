@@ -24,6 +24,9 @@ For every **Ubuntu machine** it reaches it reports:
   `backports`/`proposed`/third-party (`other`). ESM security fixes available with an Ubuntu Pro
   subscription are flagged as **needs Pro** (`pending_attach` / `pending_enable` from `pro security-status`),
   and the summary shows how many instances would benefit from Ubuntu Pro.
+- Livepatch (`canonical-livepatch status`): client installed/enabled, whether the running kernel is
+  supported (or needs an upgrade / is end-of-life), and which livepatch version and CVE fixes are
+  applied (CVE list with `--details`)
 - Reboot required (plus the packages that triggered it; livepatch-aware)
 - Kernel (`uname -r`), OS (`lsb_release -a`)
 - Installed package count and sources (main / restricted / universe / multiverse / ESM / third-party

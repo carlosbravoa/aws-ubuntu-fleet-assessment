@@ -3,7 +3,8 @@
 
 Runs a read-only collector (collector.py) on every Ubuntu machine it finds and reports
 Pro attachment, pending updates per pocket (security / updates / ESM-Infra / ESM-Apps /
-...), reboot status, kernel, OS release and installed-package sources.
+...), Livepatch status (kernel supported? patches applied?), reboot status, kernel,
+OS release and installed-package sources.
 
   --transport ssm   online Ubuntu SSM managed nodes in one or more regions (no SSH keys)
   --transport ssh   EC2 instances reached over SSH, or an explicit --host list (no SSM agent)
@@ -60,6 +61,7 @@ def row_fields(inst):
     enabled = sorted(k for k, v in (pro.get("services") or {}).items() if v == "enabled")
     rr = summ.get("reboot_required")
     reboot = rr if rr else ("yes" if d.get("reboot_required") else "no")
+    lp = d.get("livepatch") or {}
     src = d.get("package_sources") or {}
     third = sum(v for k, v in src.items() if k.startswith("3rd-party:")) if "error" not in src else None
     return {
@@ -80,8 +82,14 @@ def row_fields(inst):
         **{f"{p.replace('-', '_')}_available_with_pro": d["needs_pro_counts"].get(p, 0) if "needs_pro_counts" in d
            else sum(v for k, v in br.get(p, {}).items() if k.startswith("pending")) for p in ("esm-infra", "esm-apps")},
         "reboot_required": reboot, "reboot_pkgs": " ".join(d.get("reboot_required_pkgs", [])),
+        "livepatch_installed": lp.get("installed"), "livepatch_enabled": lp.get("enabled"),
+        "livepatch_kernel_supported": lp.get("supported"), "livepatch_state": lp.get("state"),
+        "livepatch_version": lp.get("version"), "livepatch_fixes": " ".join(lp.get("fixes") or []),
+        "livepatch_patched_cves": lp.get("patched_cves"), "livepatch_last_check": lp.get("last_check"),
+        "livepatch_upgrade_required_date": lp.get("upgrade_required_date"),
         "livepatch_fixed_cves": pro.get("livepatch_fixed_cves"),
-        "warnings": "; ".join(d.get("warnings", []) + [v for k, v in pro.items() if k.endswith("_error")]),
+        "warnings": "; ".join(d.get("warnings", []) + [v for k, v in pro.items() if k.endswith("_error")]
+                              + (["livepatch: " + lp["error"]] if lp.get("error") and lp.get("enabled") is not False else [])),
     }
 
 
@@ -95,6 +103,28 @@ def esm_cell(total, pending):
     if pending:
         return f"[yellow]{total}[/] [dim]({'needs Pro' if pending == total else f'{pending} need Pro'})[/]"
     return f"[green]{total}[/]"
+
+
+LP_BAD = ("unsupported", "kernel-upgrade-required", "kernel-end-of-life", "apply-failed")
+
+
+def livepatch_cell(f):
+    """One-line Livepatch state: kernel support first, then what was applied."""
+    if not f["livepatch_installed"]:
+        return "[dim]not installed[/]"
+    if not f["livepatch_enabled"]:
+        return "[yellow]not enabled[/]"
+    sup, st = f["livepatch_kernel_supported"] or "", f["livepatch_state"] or ""
+    if sup and sup != "supported":
+        return f"[red]kernel {sup.replace('-', ' ').replace('kernel ', '')}[/]"
+    if st == "applied":
+        n = len(f["livepatch_fixes"].split()) if f["livepatch_fixes"] else 0
+        return f"[green]applied {f['livepatch_version'] or ''}[/]".rstrip() + (f" [dim]({n} CVEs)[/]" if n else "")
+    if st == "nothing-to-apply":
+        return "[green]supported, none needed[/]"
+    if st in LP_BAD:
+        return f"[red]{st}[/]"
+    return f"[yellow]{st or sup or 'unknown'}[/]"
 
 
 MAX_LIST = 15  # per-instance notice lines printed before collapsing (fleets can be large)
@@ -116,7 +146,7 @@ def render(report, details, transport="SSM"):
                     ("Pro", {}), ("Pkgs", {"justify": "right"}), ("Sources m/r/u/mv/3p/unk", {}),
                     ("Security", {"justify": "right"}), ("Updates", {"justify": "right"}),
                     ("ESM-Infra", {"justify": "right"}), ("ESM-Apps", {"justify": "right"}),
-                    ("Other", {"justify": "right"}), ("Reboot", {})]:
+                    ("Other", {"justify": "right"}), ("Reboot", {}), ("Livepatch", {})]:
         t.add_column(col, **kw)
     errors, rows = [], []
     for reg in report["regions"]:
@@ -142,11 +172,12 @@ def render(report, details, transport="SSM"):
                       fmt_count(f["upd_security"], "red"), fmt_count(f["upd_updates"], "yellow"),
                       esm_cell(f["upd_esm_infra"], f["esm_infra_available_with_pro"]),
                       esm_cell(f["upd_esm_apps"], f["esm_apps_available_with_pro"]),
-                      fmt_count(other, "cyan"), reboot)
+                      fmt_count(other, "cyan"), reboot, livepatch_cell(f))
     out.print(t)
     out.print("[dim]Sources: main/restricted/universe/multiverse/third-party/unknown. "
               "Security = standard -security pocket; Updates = non-security -updates pocket; "
-              "ESM 'needs Pro' = security fixes available with an Ubuntu Pro subscription.[/]")
+              "ESM 'needs Pro' = security fixes available with an Ubuntu Pro subscription. "
+              "Livepatch = canonical-livepatch status (kernel supported? patches applied?).[/]")
 
     if details:
         for reg in report["regions"]:
@@ -169,6 +200,10 @@ def render(report, details, transport="SSM"):
                         ", ".join(f"{k}={v}" for k, v in sorted(src.items(), key=lambda kv: -kv[1]))
                 if ups or pt.caption:
                     out.print(pt)
+                lp = d.get("livepatch") or {}
+                if lp.get("fixes"):
+                    out.print(f"[dim]{inst['instance_id']} livepatch {lp.get('version') or ''} "
+                              f"({lp.get('state')}) fixes: {', '.join(lp['fixes'])}[/]")
 
     # Summary
     s = Table(title="Summary", show_header=False)
@@ -178,6 +213,11 @@ def render(report, details, transport="SSM"):
     s.add_row("Assessed instances", str(n))
     s.add_row("Pro attached", f"{sum(1 for r in rows if r['pro_attached'])}/{n}")
     s.add_row("Reboot required", str(sum(1 for r in rows if r["reboot_required"].startswith("yes"))))
+    s.add_row("Livepatch enabled", f"{sum(1 for r in rows if r['livepatch_enabled'])}/{n}")
+    s.add_row("Livepatch: patches applied", str(sum(1 for r in rows if r["livepatch_state"] == "applied")))
+    s.add_row("Livepatch: kernel unsupported / needs upgrade",
+              str(sum(1 for r in rows if r["livepatch_enabled"] and
+                      (r["livepatch_kernel_supported"] not in (None, "", "supported") or r["livepatch_state"] in LP_BAD))))
     for p in POCKETS:
         k = f"upd_{p.replace('-', '_')}"
         tot = sum(r[k] for r in rows)

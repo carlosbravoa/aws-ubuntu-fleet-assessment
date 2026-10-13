@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Remote collector executed on each Ubuntu instance through SSM (AWS-RunShellScript) or SSH.
 
-Gathers OS/kernel info, Ubuntu Pro status, `pro security-status`, pending updates
-per pocket, installed package sources and reboot status, then prints a single
+Gathers OS/kernel info, Ubuntu Pro status, `pro security-status`, Livepatch status
+(`canonical-livepatch status`), pending updates per pocket, installed package sources
+and reboot status, then prints a single
 line: "PFA1:" + base64(gzip(json)). Must stay compatible with old Python 3
 (xenial/bionic): no f-strings, no walrus, no subprocess.run(capture_output=...).
 """
@@ -30,7 +31,7 @@ def run(cmd, timeout=300):
 
 
 def which(name):
-    for d in os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").split(":") + ["/usr/bin", "/usr/sbin"]:
+    for d in os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").split(":") + ["/usr/bin", "/usr/sbin", "/snap/bin"]:
         p = os.path.join(d, name)
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
@@ -175,6 +176,54 @@ def pro_data(pro):
     return res
 
 
+def _get(d, *names):
+    """Case-insensitive key lookup: the livepatch JSON changed casing across client versions
+    (patchState/State, Fixes/fixes...)."""
+    low = {str(k).lower(): v for k, v in (d or {}).items()}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def livepatch_data():
+    """`canonical-livepatch status`: is the running kernel supported, which livepatches are applied."""
+    lp = which("canonical-livepatch")
+    res = {"installed": bool(lp)}
+    if not lp:
+        return res
+    rc, out, err = run([lp, "status", "--format", "json"], 60)
+    if rc != 0:  # typically "Machine is not enabled. Please run 'sudo canonical-livepatch enable'..."
+        res["enabled"] = False
+        res["error"] = (err or out).strip().splitlines()[0][:200] if (err or out).strip() else "rc %d" % rc
+        return res
+    try:
+        st = json.loads(out)
+    except Exception as e:
+        res["error"] = "bad json: " + str(e)[:200]
+        return res
+    res["enabled"] = True
+    res["client_version"] = _get(st, "Client-Version")
+    res["tier"] = _get(st, "tier")
+    res["last_check"] = _get(st, "Last-Check")
+    kernels = _get(st, "Status") or []
+    cur = next((k for k in kernels if _get(k, "Running")), kernels[0] if kernels else {})
+    patch = _get(cur, "Livepatch") or {}
+    res["kernel"] = _get(cur, "Kernel")
+    res["supported"] = _get(cur, "Supported")  # supported / unsupported / kernel-upgrade-required / kernel-end-of-life
+    res["upgrade_required_date"] = _get(cur, "UpgradeRequiredDate")
+    res["check_state"] = _get(patch, "CheckState")
+    res["state"] = _get(patch, "State", "patchState")  # applied / nothing-to-apply / unapplied / apply-failed ...
+    res["version"] = _get(patch, "Version") or None
+    fixes = _get(patch, "Fixes") or ""
+    if isinstance(fixes, str):  # "* CVE-2024-1234\n* CVE-..." (one per line, bullet optional)
+        fixes = [l.strip(" *-\t") for l in fixes.splitlines() if l.strip(" *-\t")]
+    res["fixes"] = list(fixes)[:200]
+    patched = _get(_get(st, "Fixed-CVEs") or {}, "Patched-CVEs") or []
+    res["patched_cves"] = len(patched)
+    return res
+
+
 def main():
     skip_update = "--skip-apt-update" in sys.argv
     data = {"schema": 1, "warnings": []}
@@ -192,6 +241,7 @@ def main():
 
     pro = which("pro") or which("ua")
     data["pro"] = pro_data(pro)
+    data["livepatch"] = livepatch_data()
 
     rc, out, _ = run(["dpkg-query", "-W", "-f", "${db:Status-Abbrev} ${Package} ${Version}\\n"])
     installed = {}
