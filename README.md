@@ -3,6 +3,8 @@
 Read-only Ubuntu Pro / patch-status assessment of an AWS fleet, over **SSM Run Command**
 (default) or **SSH**. One entry point, one report, one collector:
 
+![Example run: fleet table and summary](docs/fleet-assessment.png)
+
 ```
 pro_fleet_assess.py   entry point: shared flags, report, table/CSV/JSON
 transport_ssm.py      SSM discovery + Run Command execution
